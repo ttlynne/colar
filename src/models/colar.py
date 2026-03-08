@@ -28,12 +28,13 @@ class LitCoLaR(LitCoTModelBase):
             intermediate_size=latent_policy_config.get("lp_intermediate_size", self.llm.config.hidden_size),
             deterministic=latent_policy_config.get("lp_determinisitc", False),
         )
-        self.embeds_std = MODEL_EMB_STD[model_kwargs.model_id]
+        # For VL models, look up by base model_id or fall back to a sensible default.
+        self.embeds_std = MODEL_EMB_STD.get(model_kwargs.model_id, 0.02)
 
         if model_kwargs.do_rl:
             self.init_rl()
 
-    # ++ basic methods implemenration begins ++#
+    # ── basic methods ─────────────────────────────────────────────────────────
     def limit_rl_train_epoch_length(self):
         n_indices = self.model_kwargs.rl_config.n_train_samples_per_epoch
         all_indices = self.trainer.datamodule.get_all_train_indices()
@@ -55,9 +56,8 @@ class LitCoLaR(LitCoTModelBase):
             return self.rl_training_step(batch=batch, batch_idx=batch_idx, dataloader_idx=dataloader_idx)
         else:
             return self.sft_training_step(batch=batch, batch_idx=batch_idx, dataloader_idx=dataloader_idx)
-    # -- basic methods implemenration ends --#
 
-    # ++ sft implementation begins ++#
+    # ── SFT ───────────────────────────────────────────────────────────────────
     def sft_training_step(self, batch, batch_idx, dataloader_idx=0):
         log_dict = self.forward(batch=batch)
         log_dict = {f'train/{k}': v for k, v in log_dict.items()}
@@ -74,24 +74,37 @@ class LitCoLaR(LitCoTModelBase):
             r = int(random.choice(max_compression_factor))
         else:
             raise ValueError("max_compression_factor should be int or str")
-        # 0: prepare inputs
+
+        # ── 0: prepare question inputs ────────────────────────────────────────
         question = batch["question"]
         steps = batch["steps"]
         answer = batch["answer"]
+        images = batch.get("image", None)   # NEW: list of PIL images or None
         batch_size = len(question)
 
-        # question: [pad, question, speed]
         auto_prob = latent_cot_config.get("replace_r_with_auto_prob", 0)
-        if random.random() < auto_prob:
-            speed = "auto"
-        else:
-            speed = r
-        question_input_ids, question_attention_mask = self.prepare_inputs(
-            question, padding_side="left", part="question", suffix=self.speed_template.format(speed)
-        )
-        question_inputs_embeds = self.embedding(question_input_ids)
+        speed = "auto" if random.random() < auto_prob else r
 
-        # steps: [pad, ###, steps]
+        if self.is_vl:
+            # ── VL path: encode question + image together ─────────────────────
+            images = images or [None] * batch_size
+            suffix = self.speed_template.format(speed)
+            question_inputs_embeds, question_attention_mask, question_position_ids, question_input_ids = (
+                self.prepare_inputs_vl(question, images, padding_side="left", suffix=suffix)
+            )
+            # question_input_ids is needed below for label construction; for VL
+            # the visual tokens map to <image_pad> ids which we mask out anyway.
+        else:
+            # ── text-only path (original) ─────────────────────────────────────
+            question_input_ids, question_attention_mask = self.prepare_inputs(
+                question, padding_side="left", part="question", suffix=self.speed_template.format(speed)
+            )
+            question_inputs_embeds = self.embedding(question_input_ids)
+            question_position_ids = get_position_ids_from_attention_mask(question_attention_mask)
+
+        # ── 1: prepare steps (reasoning chain) embeddings ────────────────────
+        # This block is identical to the original regardless of VL/text mode,
+        # because reasoning tokens are always pure text.
         steps_input_ids, steps_attention_mask = self.prepare_inputs(
             steps, padding_side="left", part="steps", prefix=self.thinking_separator
         )
@@ -99,40 +112,31 @@ class LitCoLaR(LitCoTModelBase):
             steps_inputs_embeds = self.embedding(steps_input_ids)
             steps_labels = steps_input_ids
         else:
-            # better skip this else branch as it is really complex
             steps_pad_lengths = -(steps_attention_mask - 1).sum(dim=-1)
-            # make sure there are $k*r - 1$ pad tokens before first token ('###'), so that the first token will be at position $k*r$
-            # left pad the steps_input_ids and steps_attention_mask
-            # suppose r=3, and there are already 4 pad tokens, to make '###' the 6th token, we need to pad 1 more
             n_extra_left_pad_length = r - 1 - steps_pad_lengths % r
             steps_length_left_padded = steps_attention_mask.shape[1] + n_extra_left_pad_length.max()
-            # make the whole seq divisible to r
             min_right_pad_length = r - steps_length_left_padded % r
             all_steps_input_ids = []
             all_steps_attention_mask = []
             for b, l_length in enumerate(n_extra_left_pad_length):
                 r_length = min_right_pad_length + (r - 1 - l_length)
-                if r_length == r:  # if we should pad r extra tokens to the right
-                    l_length += r  # we pad it left instead
-                    r_length = 0  # to keep the last compressed token not a pad token
+                if r_length == r:
+                    l_length += r
+                    r_length = 0
                 s_ids = steps_input_ids[b]
                 s_attn_mask = steps_attention_mask[b]
                 if l_length > 0:
                     s_ids = torch.cat(
-                        [
-                            torch.ones(l_length, device=s_ids.device, dtype=s_ids.dtype) * self.tokenizer.pad_token_id,
-                            s_ids,
-                        ]
+                        [torch.ones(l_length, device=s_ids.device, dtype=s_ids.dtype) * self.tokenizer.pad_token_id,
+                         s_ids]
                     )
                     s_attn_mask = torch.cat(
                         [torch.zeros(l_length, device=s_attn_mask.device, dtype=s_attn_mask.dtype), s_attn_mask]
                     )
                 if r_length > 0:
                     s_ids = torch.cat(
-                        [
-                            s_ids,
-                            torch.ones(r_length, device=s_ids.device, dtype=s_ids.dtype) * self.tokenizer.pad_token_id,
-                        ]
+                        [s_ids,
+                         torch.ones(r_length, device=s_ids.device, dtype=s_ids.dtype) * self.tokenizer.pad_token_id]
                     )
                     s_attn_mask = torch.cat(
                         [s_attn_mask, torch.zeros(r_length, device=s_attn_mask.device, dtype=s_attn_mask.dtype)]
@@ -157,18 +161,16 @@ class LitCoLaR(LitCoTModelBase):
             compressed_steps_inputs_embeds /= compressed_steps_attention_mask.unsqueeze(-1) + 1e-5
             compressed_steps_attention_mask = (compressed_steps_attention_mask != 0).long()
             compressed_steps_labels = padded_steps_input_ids.reshape(batch_size, compressed_steps_length, r)
-            # rand_steps_indices = torch.randint(0, r, (batch_size, compressed_steps_length, 1), device=steps_input_ids.device)
             rand_steps_indices = sample_indices_from_attention_mask_3d(
                 padded_steps_attention_mask.view(batch_size, compressed_steps_length, r)
             )
             compressed_steps_labels = compressed_steps_labels.gather(dim=2, index=rand_steps_indices).squeeze(dim=2)
 
-            # finally we are here:
             steps_inputs_embeds = compressed_steps_inputs_embeds
             steps_attention_mask = compressed_steps_attention_mask
             steps_labels = compressed_steps_labels
 
-        # answer: [###, answer, eos, pad]
+        # ── 2: prepare answer embeddings ──────────────────────────────────────
         answer_input_ids, answer_attention_mask = self.prepare_inputs(
             answer,
             padding_side="right",
@@ -181,12 +183,24 @@ class LitCoLaR(LitCoTModelBase):
         question_length = question_inputs_embeds.shape[1]
         steps_length = steps_inputs_embeds.shape[1]
 
+        # ── 3: concatenate and forward ────────────────────────────────────────
         inputs_embeds = torch.cat([question_inputs_embeds, steps_inputs_embeds, answer_inputs_embeds], dim=1)
         attention_mask = torch.cat([question_attention_mask, steps_attention_mask, answer_attention_mask], dim=1)
-        position_ids = get_position_ids_from_attention_mask(attention_mask)
+
+        if self.is_vl:
+            # For VL, position_ids for the question part are already computed by
+            # the VL model (M-RoPE). We extend them linearly for steps + answer.
+            q_last_pos = question_position_ids[:, -1:]          # [B, 1]
+            n_extra = steps_inputs_embeds.shape[1] + answer_inputs_embeds.shape[1]
+            extra_pos = q_last_pos + torch.arange(1, n_extra + 1, device=self.device).unsqueeze(0)
+            position_ids = torch.cat([question_position_ids, extra_pos], dim=1)
+        else:
+            position_ids = get_position_ids_from_attention_mask(attention_mask)
+
+        # Labels: only supervise steps and answer tokens
         labels = torch.cat([question_input_ids, steps_labels, answer_input_ids], dim=1)
         labels[labels == self.tokenizer.pad_token_id] = -100
-        labels[:, :question_length] = -100
+        labels[:, :question_length] = -100   # mask the entire question (incl. image tokens)
 
         outputs = self.llm.forward(
             inputs_embeds=inputs_embeds,
@@ -197,10 +211,10 @@ class LitCoLaR(LitCoTModelBase):
         )
         ce_loss = outputs.loss
 
-        # latent loss
-        steps_outputs = outputs.hidden_states[-1][:, question_length : question_length + steps_length, :]
+        # ── 4: latent loss ────────────────────────────────────────────────────
+        steps_outputs = outputs.hidden_states[-1][:, question_length: question_length + steps_length, :]
         distributions = self.latent_policy.forward(steps_outputs)
-        gold_embeds = inputs_embeds[:, question_length + 1 : question_length + steps_length + 1, :]
+        gold_embeds = inputs_embeds[:, question_length + 1: question_length + steps_length + 1, :]
         pred_embeds = distributions.rsample()
         if latent_cot_config.get("embed_modeling_loss", "nll") == "nll":
             embed_modeling_loss = -distributions.log_prob(gold_embeds.detach() / self.embeds_std).mean(dim=-1)
@@ -213,14 +227,14 @@ class LitCoLaR(LitCoTModelBase):
         entropy = distributions.entropy().mean(dim=-1)
         entropy = (entropy * steps_attention_mask).sum() / steps_attention_mask.sum()
 
-        # pred_embed_forward  # only used in NLL loss for faster convergence
+        # ── 5: pred_embed_forward loss ────────────────────────────────────────
         if latent_cot_config.pred_embed_forward_weight != 0:
             second_input_embeds = torch.cat(
                 [
-                    question_inputs_embeds,  # question: [pad, question]
-                    answer_inputs_embeds[:, 0:1, :],  #: ['###']
-                    pred_embeds[:, 1:, :],  # [pad, steps]
-                    answer_inputs_embeds,  # [###, answer, eos, pad]
+                    question_inputs_embeds,
+                    answer_inputs_embeds[:, 0:1, :],
+                    pred_embeds[:, 1:, :],
+                    answer_inputs_embeds,
                 ],
                 dim=1,
             )
@@ -233,8 +247,13 @@ class LitCoLaR(LitCoTModelBase):
                 ],
                 dim=1,
             )
-            second_position_ids = get_position_ids_from_attention_mask(second_attention_mask)
-            # only supervise the answer
+            if self.is_vl:
+                q_last_pos2 = question_position_ids[:, -1:]
+                n_extra2 = second_input_embeds.shape[1] - question_inputs_embeds.shape[1]
+                extra_pos2 = q_last_pos2 + torch.arange(1, n_extra2 + 1, device=self.device).unsqueeze(0)
+                second_position_ids = torch.cat([question_position_ids, extra_pos2], dim=1)
+            else:
+                second_position_ids = get_position_ids_from_attention_mask(second_attention_mask)
             second_outputs = self.llm.forward(
                 inputs_embeds=second_input_embeds,
                 attention_mask=second_attention_mask,
@@ -245,7 +264,7 @@ class LitCoLaR(LitCoTModelBase):
         else:
             pred_embed_forward_loss = 0.0
 
-        # total loss
+        # ── 6: total loss ─────────────────────────────────────────────────────
         total_loss = 0
         if latent_cot_config.get("ce_weight", 1) != 0:
             total_loss += ce_loss * latent_cot_config.ce_weight
@@ -264,9 +283,7 @@ class LitCoLaR(LitCoTModelBase):
             "entropy": entropy,
         }
 
-    # -- sft training ends --#
-
-    # ++ rl implementation begins ++#
+    # ── RL ────────────────────────────────────────────────────────────────────
     def init_rl(self):
         self.grpo_loss = grpo.GRPOLoss(rl_config=self.model_kwargs.rl_config)
         self.replay_buffer = grpo.ReplayBuffer()
@@ -274,18 +291,14 @@ class LitCoLaR(LitCoTModelBase):
 
     @torch.no_grad()
     def filter_train_indices(self, dataloader_to_filter_indices):
-        """
-        this function is not used in our paper, but might be helpful for future work
-        """
         train_indices = []
         for batch in tqdm.tqdm(dataloader_to_filter_indices, desc="filtering train indices"):
             q = batch["question"]
             a = batch["answer"]
             idx = batch["idx"]
-            batch_size = idx.shape[0]  # (batch_size, 1)
+            batch_size = idx.shape[0]
             exp = self.batch_rollout(questions=q, gt_answers=a)
-            mean_acc = exp.accuracies.reshape(batch_size, -1).mean(-1)  # (batch_size, 1)
-            # remove too easy questions
+            mean_acc = exp.accuracies.reshape(batch_size, -1).mean(-1)
             train_indices.extend(idx[mean_acc.cpu() < 1.0].tolist())
         self.text_logger.log(f"filtered {len(train_indices)} train indices")
         return train_indices
@@ -294,10 +307,11 @@ class LitCoLaR(LitCoTModelBase):
         rl_config = self.model_kwargs.rl_config
         questions = batch["question"]
         answers = batch["answer"]
+        images = batch.get("image", None)   # NEW
         self.replay_buffer.clear()
         optimizer = self.optimizers()
 
-        experience = self.rollout(questions=questions, gt_answers=answers)
+        experience = self.rollout(questions=questions, gt_answers=answers, images=images)
         self.replay_buffer.append(experience.to("cpu"))
 
         self.log_dict(
@@ -333,8 +347,7 @@ class LitCoLaR(LitCoTModelBase):
             self.log_dict(log_dict)
 
     @torch.no_grad()
-    def rollout(self, questions: List[str], gt_answers) -> grpo.Experience:
-        # 0: prepare variables
+    def rollout(self, questions: List[str], gt_answers, images=None) -> grpo.Experience:
         rl_config = self.model_kwargs.rl_config
         batch_size = len(questions)
         group_size = rl_config.group_size
@@ -343,23 +356,30 @@ class LitCoLaR(LitCoTModelBase):
         for q in questions:
             group_questions.extend([q] * group_size)
 
-        # 1: sample
+        # Repeat images to match group_questions
+        if images is not None:
+            group_images = []
+            for img in images:
+                group_images.extend([img] * group_size)
+        else:
+            group_images = None
+
         (question_input_ids, question_attention_mask, latent_inputs_embeds, latent_attention_mask, pred_ids) = (
             self.latent_generate(
                 questions=group_questions,
+                images=group_images,
                 rl_mode=True,
             )
         )
         pred_answer_strings = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
 
-        # 2: calculate rewards
         n_latent_forward = latent_attention_mask.sum(dim=1)
         all_rewards = []
         all_accuracies = []
         all_advantages = []
         for sample_idx in range(batch_size):
-            group_answers = pred_answer_strings[sample_idx * group_size : (sample_idx + 1) * group_size]
-            group_n_latent_forward = n_latent_forward[sample_idx * group_size : (sample_idx + 1) * group_size]
+            group_answers = pred_answer_strings[sample_idx * group_size: (sample_idx + 1) * group_size]
+            group_n_latent_forward = n_latent_forward[sample_idx * group_size: (sample_idx + 1) * group_size]
             gt_answer = gt_answers[sample_idx]
             rewards, accuracies = self.get_group_rewards_and_acc(
                 pred_answers=group_answers, gt_answer=gt_answer, n_latent_forward=group_n_latent_forward
@@ -373,7 +393,6 @@ class LitCoLaR(LitCoTModelBase):
         accuracies = torch.cat(all_accuracies, dim=0)
         advantages = torch.cat(all_advantages, dim=0)
 
-        # 3: calculate logprobs
         experience = grpo.Experience(
             question_input_ids=question_input_ids,
             question_attention_mask=question_attention_mask,
@@ -432,21 +451,18 @@ class LitCoLaR(LitCoTModelBase):
             output_hidden_states=True,
         )
         last_hidden_states_for_latents = all_outputs.hidden_states[-1][
-            :, question_length - 1 : question_length + latent_length - 1
+            :, question_length - 1: question_length + latent_length - 1
         ]
         distributions = self.latent_policy.forward(last_hidden_states_for_latents)
         latent_logprobs = distributions.log_prob(e.latent_inputs_embeds / self.embeds_std).mean(dim=-1)
 
-        # logits for end of think
         logits_for_eol = []
         for b, latent_length in enumerate(e.n_latent_forward):
             logits_for_eol.append(all_outputs.logits[b, question_length + latent_length - 1])
         logits_for_eol = torch.stack(logits_for_eol, dim=0)
-        # answer_logprobs
+
         answer_logits = torch.cat([logits_for_eol, all_outputs.logits[:, -answer_length:-1, :]], dim=1)
         answer_logprobs = F.log_softmax(answer_logits, dim=-1)
         answer_logprobs = answer_logprobs.gather(dim=-1, index=e.answer_input_ids.unsqueeze(-1)).squeeze(-1)
 
         return latent_logprobs, answer_logprobs
-
-    # -- rl ends --#

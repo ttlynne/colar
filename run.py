@@ -215,7 +215,7 @@ def get_args():
 
     parser.add_argument("--load_ckpt_path", type=str, help="load ckpt as initialization", default=None)
 
-    parser.add_argument("--workspace_path", type=str, help="assign the path of user workspace directory", default="/workspace/images-ks3-starfs/workspace/wenhui")
+    parser.add_argument("--workspace_path", type=str, help="assign the path of user workspace directory", default="/mnt/a100_2_data3/tangyueling")
 
     parser.add_argument("--do_test", help="test after training", action="store_true")
 
