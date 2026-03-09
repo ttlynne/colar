@@ -25,7 +25,7 @@ MODEL_EMB_STD = {
     "Qwen2.5-VL-72B-Instruct": 0.010,  # approximate; measure before use
 
     # ── Qwen3-VL models (NEW) ─────────────────────────────────────────────────
-    "Qwen3-VL-7B-Instruct": 0.014,     # approximate; measure before use
+    "Qwen3-VL-2B-Instruct": 0.014,     # approximate; measure before use
     "Qwen3-VL-32B-Instruct": 0.010,    # approximate; measure before use
 }
 

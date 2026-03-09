@@ -41,54 +41,26 @@ from pathlib import Path
 
 def load_mathvista(source_dir: Path):
     """
-    MathVista — HuggingFace Arrow format (dataset_dict.json + testmini/ + test/).
-    Fields available: pid, question, image (filename str), decoded_image (PIL),
-                      choices, answer, solution, ...
+    MathVista (https://mathvista.github.io/).
+    Expects the original testmini.json / test.json from the official release.
     """
-    from datasets import load_from_disk
-    import os
-
     records = []
-    # Arrow format: load each split subfolder separately
-    split_dirs = [d for d in source_dir.iterdir()
-                  if d.is_dir() and (d / "data-00000-of-00001.arrow").exists()]
-
-    if not split_dirs:
-        raise FileNotFoundError(
-            f"No Arrow split directories found under {source_dir}. "
-            "Expected subdirs like testmini/ or test/ containing .arrow files."
-        )
-
-    img_save_dir = source_dir  # images will be saved to output_dir/images/ later
-
-    for split_dir in split_dirs:
-        print(f"  Loading split: {split_dir.name} …")
-        ds = load_from_disk(str(split_dir))
-
-        for item in ds:
-            pid        = str(item.get("pid", ""))
-            question   = item.get("question", "")
-            answer     = str(item.get("answer", ""))
-            solution   = item.get("solution", "") or ""
-            decoded_img = item.get("decoded_image", None)  # PIL.Image or None
-            image_name  = item.get("image", None)          # original filename string
-
-            # Build a stable image filename from pid
-            if decoded_img is not None:
-                img_filename = f"{pid}.png" if pid else f"{len(records)}.png"
-            else:
-                img_filename = None
-
+    for split_file in source_dir.glob("*.json"):
+        with open(split_file) as f:
+            raw = json.load(f)
+        # MathVista is a dict: {id: {question, answer, image, solution, ...}}
+        if isinstance(raw, dict):
+            raw = list(raw.values())
+        for item in raw:
+            image_file = item.get("image", None)
             records.append({
-                "question": question,
-                "answer": answer,
-                "steps": _split_solution(solution),
-                "image_path": f"images/{img_filename}" if img_filename else None,
-                # Store the PIL image directly so _copy_images can save it
-                "_pil_image": decoded_img,
-                "_raw_image_src": None,   # not a file path; handled via _pil_image
+                "question": item["question"],
+                "answer": str(item.get("answer", item.get("gt_answer", ""))),
+                # MathVista does not always provide step-by-step; use solution if present
+                "steps": _split_solution(item.get("solution", item.get("rationale", ""))),
+                "image_path": f"images/{image_file}" if image_file else None,
+                "_raw_image_src": str(source_dir / image_file) if image_file else None,
             })
-
     return records
 
 
@@ -151,29 +123,16 @@ def _split_solution(solution: str):
 
 
 def _copy_images(records, output_dir: Path):
-    """Copy / save referenced images into output_dir/images/."""
+    """Copy referenced images into output_dir/images/."""
     img_dir = output_dir / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
-
     for rec in records:
-        pil_img   = rec.pop("_pil_image", None)
-        file_src  = rec.pop("_raw_image_src", None)
-        img_path  = rec.get("image_path")
-
-        if img_path is None:
-            continue
-
-        dst = output_dir / img_path
-        dst.parent.mkdir(parents=True, exist_ok=True)
-
-        if dst.exists():
-            continue
-
-        if pil_img is not None:
-            # MathVista: decoded_image is already a PIL.Image → just save it
-            pil_img.save(str(dst))
-        elif file_src and Path(file_src).exists():
-            shutil.copy2(file_src, dst)
+        src = rec.pop("_raw_image_src", None)
+        if src and Path(src).exists():
+            dst = output_dir / rec["image_path"]
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if not dst.exists():
+                shutil.copy2(src, dst)
 
 
 def _split_records(records, val_ratio=0.05, test_ratio=0.1, seed=42):

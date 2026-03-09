@@ -6,7 +6,7 @@ import torch
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 
-from .model_base import LitCoTModelBase
+from .model_base import LitCoTModelBase, _get_hidden_size
 from ..modules.projector import LatentPolicy
 from ..modules import grpo
 from ..utils.utils import get_position_ids_from_attention_mask, sample_indices_from_attention_mask_3d
@@ -24,8 +24,8 @@ class LitCoLaR(LitCoTModelBase):
 
         latent_policy_config = model_kwargs.latent_policy_config
         self.latent_policy = LatentPolicy(
-            feature_size=self.llm.config.hidden_size,
-            intermediate_size=latent_policy_config.get("lp_intermediate_size", self.llm.config.hidden_size),
+            feature_size=_get_hidden_size(self.llm),
+            intermediate_size=latent_policy_config.get("lp_intermediate_size", _get_hidden_size(self.llm)),
             deterministic=latent_policy_config.get("lp_determinisitc", False),
         )
         # For VL models, look up by base model_id or fall back to a sensible default.

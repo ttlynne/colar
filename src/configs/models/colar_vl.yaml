@@ -6,9 +6,10 @@ model:
     # ── Switch the backbone to Qwen2.5-VL ────────────────────────────────────
     # Use the model name exactly as it appears in your local models directory.
     # e.g. if stored at  <workspace>/models/llms/Qwen2.5-VL-3B-Instruct/
-    model_id: Qwen2.5-VL-3B-Instruct
-    # model_id: Qwen2.5-VL-7B-Instruct       # larger variant
-    # model_id: Qwen3-VL-7B-Instruct          # Qwen3 variant (if available)
+    model_id: Qwen3-VL-2B-Instruct
+    # model_id: Qwen2.5-VL-3B-Instruct
+    # model_id: Qwen2.5-VL-7B-Instruct
+    # model_id: Qwen3-VL-7B-Instruct
 
     sft_method: colar
     chat_template: False   # VL uses its own chat template via the processor
@@ -45,7 +46,10 @@ model:
       lp_determinisitc: False
       # Qwen2.5-VL-3B hidden size = 2048  (same as Llama-3.2-1B-Instruct)
       # Qwen2.5-VL-7B hidden size = 3584  → change to 3584 for the 7B model
-      lp_intermediate_size: 2048
+      # Qwen3-VL-2B hidden_size = 1536
+      # Qwen2.5-VL-3B hidden_size = 2048
+      # Qwen2.5-VL-7B hidden_size = 3584
+      lp_intermediate_size: 1536
 
     # ── Generation ────────────────────────────────────────────────────────────
     latent_generation_config:

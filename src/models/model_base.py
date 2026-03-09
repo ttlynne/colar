@@ -16,18 +16,36 @@ def _is_vl_model(model_id: str) -> bool:
     return "VL" in model_id or "vl" in model_id.lower()
 
 def _load_vl_model_and_processor(llm_path: str):
-    """Load a Qwen2.5-VL or Qwen3-VL model together with its processor."""
-    # Try Qwen3-VL first, then Qwen2.5-VL
-    try:
-        from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(llm_path)
-        processor = AutoProcessor.from_pretrained(llm_path)
-        return model, processor
-    except Exception:
-        raise ImportError(
-            "Could not load VL model. Make sure you have installed:\n"
-            "  pip install transformers>=4.49 qwen-vl-utils"
-        )
+    """Load a Qwen3-VL / Qwen2.5-VL model together with its processor."""
+    from transformers import AutoProcessor
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLForConditionalGeneration
+
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
+        llm_path,
+        trust_remote_code=True,
+    )
+    processor = AutoProcessor.from_pretrained(
+        llm_path,
+        trust_remote_code=True,
+    )
+    return model, processor
+
+
+def _get_hidden_size(model) -> int:
+    """
+    Robustly retrieve the LLM hidden size from a VL model config.
+    Qwen3-VL / Qwen2.5-VL nest it under text_config; plain LLMs expose it directly.
+    """
+    cfg = model.config
+    if hasattr(cfg, "text_config") and hasattr(cfg.text_config, "hidden_size"):
+        return cfg.text_config.hidden_size
+    if hasattr(cfg, "llm_config") and hasattr(cfg.llm_config, "hidden_size"):
+        return cfg.llm_config.hidden_size
+    if hasattr(cfg, "hidden_size"):
+        return cfg.hidden_size
+    raise AttributeError(
+        f"Cannot find hidden_size in model config. Keys: {list(vars(cfg).keys())}"
+    )
 
 
 class LitCoTModelBase(pl.LightningModule):
@@ -44,7 +62,7 @@ class LitCoTModelBase(pl.LightningModule):
         self.model_kwargs = model_kwargs
         self.save_hyperparameters()
 
-        llm_path = opj(all_config.args.workspace_path, "models", "llms", model_kwargs.model_id)
+        llm_path = opj(all_config.args.workspace_path, "MODELS", "Qwen", model_kwargs.model_id)
         ### IMPORTANT: replace the llm path to YOUR OWN llm path ###
 
         self.is_vl = _is_vl_model(model_kwargs.model_id)
