@@ -28,7 +28,6 @@ class LitCoLaR(LitCoTModelBase):
             intermediate_size=latent_policy_config.get("lp_intermediate_size", _get_hidden_size(self.llm)),
             deterministic=latent_policy_config.get("lp_determinisitc", False),
         )
-        # For VL models, look up by base model_id or fall back to a sensible default.
         self.embeds_std = MODEL_EMB_STD.get(model_kwargs.model_id, 0.02)
 
         if model_kwargs.do_rl:
@@ -79,21 +78,37 @@ class LitCoLaR(LitCoTModelBase):
         question = batch["question"]
         steps = batch["steps"]
         answer = batch["answer"]
-        images = batch.get("image", None)   # NEW: list of PIL images or None
+        images = batch.get("image", None)
         batch_size = len(question)
 
         auto_prob = latent_cot_config.get("replace_r_with_auto_prob", 0)
         speed = "auto" if random.random() < auto_prob else r
 
         if self.is_vl:
-            # ── VL path: encode question + image together ─────────────────────
+            # ── VL path ───────────────────────────────────────────────────────
+            # prepare_inputs_vl returns (forward_kwargs, question_input_ids)
+            # forward_kwargs has: input_ids, attention_mask, [pixel_values, image_grid_thw]
             images = images or [None] * batch_size
             suffix = self.speed_template.format(speed)
-            question_inputs_embeds, question_attention_mask, question_position_ids, question_input_ids = (
-                self.prepare_inputs_vl(question, images, padding_side="left", suffix=suffix)
+            forward_kwargs, question_input_ids = self.prepare_inputs_vl(
+                question, images, padding_side="left", suffix=suffix
             )
-            # question_input_ids is needed below for label construction; for VL
-            # the visual tokens map to <image_pad> ids which we mask out anyway.
+            question_attention_mask = forward_kwargs["attention_mask"]
+            question_position_ids = get_position_ids_from_attention_mask(question_attention_mask)
+            # We'll do the first llm forward later (with pixel_values) after
+            # concatenating steps+answer as plain embeddings.
+            # For that we need question_inputs_embeds from the embedding layer
+            # (the visual tokens will be handled by Qwen3-VL internally only
+            # when we pass input_ids+pixel_values, but for the joint forward we
+            # must use inputs_embeds path for steps/answer). Strategy:
+            # Run a "question-only" forward first to get question hidden states,
+            # then build the full sequence with inputs_embeds for non-question parts.
+            # Actually the simplest correct approach: use input_ids for question
+            # tokens + embedding for steps/answer, and pass pixel_values alongside.
+            # Qwen3-VL's forward() will replace <image_pad> token embeddings with
+            # visual features when pixel_values is present, even in inputs_embeds mode.
+            # So: embed question input_ids normally, then let model replace them.
+            question_inputs_embeds = self.embedding(question_input_ids)
         else:
             # ── text-only path (original) ─────────────────────────────────────
             question_input_ids, question_attention_mask = self.prepare_inputs(
@@ -103,8 +118,6 @@ class LitCoLaR(LitCoTModelBase):
             question_position_ids = get_position_ids_from_attention_mask(question_attention_mask)
 
         # ── 1: prepare steps (reasoning chain) embeddings ────────────────────
-        # This block is identical to the original regardless of VL/text mode,
-        # because reasoning tokens are always pure text.
         steps_input_ids, steps_attention_mask = self.prepare_inputs(
             steps, padding_side="left", part="steps", prefix=self.thinking_separator
         )
@@ -188,9 +201,7 @@ class LitCoLaR(LitCoTModelBase):
         attention_mask = torch.cat([question_attention_mask, steps_attention_mask, answer_attention_mask], dim=1)
 
         if self.is_vl:
-            # For VL, position_ids for the question part are already computed by
-            # the VL model (M-RoPE). We extend them linearly for steps + answer.
-            q_last_pos = question_position_ids[:, -1:]          # [B, 1]
+            q_last_pos = question_position_ids[:, -1:]
             n_extra = steps_inputs_embeds.shape[1] + answer_inputs_embeds.shape[1]
             extra_pos = q_last_pos + torch.arange(1, n_extra + 1, device=self.device).unsqueeze(0)
             position_ids = torch.cat([question_position_ids, extra_pos], dim=1)
@@ -202,13 +213,30 @@ class LitCoLaR(LitCoTModelBase):
         labels[labels == self.tokenizer.pad_token_id] = -100
         labels[:, :question_length] = -100   # mask the entire question (incl. image tokens)
 
-        outputs = self.llm.forward(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            labels=labels,
-            output_hidden_states=True,
-        )
+        if self.is_vl:
+            # Pass pixel_values + image_grid_thw alongside inputs_embeds so that
+            # Qwen3-VL can replace <image_pad> embeddings with visual features.
+            vl_extra = {}
+            if "pixel_values" in forward_kwargs:
+                vl_extra["pixel_values"] = forward_kwargs["pixel_values"]
+            if "image_grid_thw" in forward_kwargs:
+                vl_extra["image_grid_thw"] = forward_kwargs["image_grid_thw"]
+            outputs = self.llm.forward(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                labels=labels,
+                output_hidden_states=True,
+                **vl_extra,
+            )
+        else:
+            outputs = self.llm.forward(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                labels=labels,
+                output_hidden_states=True,
+            )
         ce_loss = outputs.loss
 
         # ── 4: latent loss ────────────────────────────────────────────────────
@@ -252,14 +280,21 @@ class LitCoLaR(LitCoTModelBase):
                 n_extra2 = second_input_embeds.shape[1] - question_inputs_embeds.shape[1]
                 extra_pos2 = q_last_pos2 + torch.arange(1, n_extra2 + 1, device=self.device).unsqueeze(0)
                 second_position_ids = torch.cat([question_position_ids, extra_pos2], dim=1)
+                second_outputs = self.llm.forward(
+                    inputs_embeds=second_input_embeds,
+                    attention_mask=second_attention_mask,
+                    position_ids=second_position_ids,
+                    labels=labels,
+                    **vl_extra,
+                )
             else:
                 second_position_ids = get_position_ids_from_attention_mask(second_attention_mask)
-            second_outputs = self.llm.forward(
-                inputs_embeds=second_input_embeds,
-                attention_mask=second_attention_mask,
-                position_ids=second_position_ids,
-                labels=labels,
-            )
+                second_outputs = self.llm.forward(
+                    inputs_embeds=second_input_embeds,
+                    attention_mask=second_attention_mask,
+                    position_ids=second_position_ids,
+                    labels=labels,
+                )
             pred_embed_forward_loss = second_outputs.loss
         else:
             pred_embed_forward_loss = 0.0
@@ -307,7 +342,7 @@ class LitCoLaR(LitCoTModelBase):
         rl_config = self.model_kwargs.rl_config
         questions = batch["question"]
         answers = batch["answer"]
-        images = batch.get("image", None)   # NEW
+        images = batch.get("image", None)
         self.replay_buffer.clear()
         optimizer = self.optimizers()
 
@@ -356,7 +391,6 @@ class LitCoLaR(LitCoTModelBase):
         for q in questions:
             group_questions.extend([q] * group_size)
 
-        # Repeat images to match group_questions
         if images is not None:
             group_images = []
             for img in images:

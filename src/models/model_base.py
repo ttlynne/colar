@@ -95,8 +95,6 @@ class LitCoTModelBase(pl.LightningModule):
 
         # ── prompt templates ──────────────────────────────────────────────────
         if self.is_vl:
-            # VL: we build the full chat message in prepare_inputs_vl(),
-            # so question_template is only used as a plain-text fallback.
             self.question_template = "Question: {} Let's think step by step:"
         elif model_kwargs.get('chat_template'):
             self.question_template = \
@@ -126,25 +124,19 @@ Question: {} Let's think step by step:
         if model_kwargs.do_lora:
             lora_cfg = dict(model_kwargs.lora_config)
             if self.is_vl:
-                # Only apply LoRA to the LLM part, NOT the ViT visual encoder.
-                # Qwen2.5-VL names the transformer layers as "model.layers.*"
-                # and the vision encoder as "visual.*".
                 lora_cfg.setdefault(
                     "target_modules",
                     ["q_proj", "k_proj", "v_proj", "o_proj",
                      "gate_proj", "up_proj", "down_proj"],
                 )
-                # Exclude visual encoder modules from LoRA
-                lora_cfg.setdefault(
-                    "modules_to_save", None,
-                )
+                lora_cfg.setdefault("modules_to_save", None)
             self.llm = get_peft_model(self.llm, peft_config=LoraConfig(**lora_cfg))
             self.llm.print_trainable_parameters()
 
         # log
         self.sample_logs = defaultdict(dict)
 
-    # ── VL helper: encode question + (optional) image into inputs_embeds ──────
+    # ── VL helper: build processor inputs for Qwen3-VL ────────────────────────
     def prepare_inputs_vl(
         self,
         question_list: List[str],
@@ -153,17 +145,16 @@ Question: {} Let's think step by step:
         suffix: str = "",
     ):
         """
-        Build the multimodal question inputs for Qwen-VL.
+        Build the multimodal question inputs for Qwen3-VL.
+
+        Qwen3-VL handles image-text fusion INSIDE its forward(), so we return
+        a dict of kwargs to be passed directly to llm.forward() / llm.generate().
 
         Returns
         -------
-        inputs_embeds : Tensor  [B, L, H]   (already on self.device)
-        attention_mask: Tensor  [B, L]       (long, on self.device)
-        position_ids  : Tensor  [B, L]       (long, on self.device)
-        input_ids     : Tensor  [B, L]       (long, on self.device)
-            — needed by RL rollout to store question_input_ids.
-            For VL inputs the visual tokens are represented as <image_pad>
-            placeholders in input_ids.
+        forward_kwargs : dict  — keys: input_ids, attention_mask, and optionally
+                                       pixel_values, image_grid_thw
+        question_input_ids : Tensor [B, L]  — for RL rollout bookkeeping
         """
         from qwen_vl_utils import process_vision_info  # pip install qwen-vl-utils
 
@@ -176,7 +167,6 @@ Question: {} Let's think step by step:
             content.append({"type": "text", "text": text_with_suffix})
             messages_batch.append([{"role": "user", "content": content}])
 
-        # apply_chat_template returns a list of strings
         texts = [
             self.processor.apply_chat_template(
                 msgs, tokenize=False, add_generation_prompt=True
@@ -184,17 +174,11 @@ Question: {} Let's think step by step:
             for msgs in messages_batch
         ]
 
-        # Collect image tensors (None entries → no pixel_values for that sample)
-        image_inputs_list = []
+        all_images = []
         for msgs in messages_batch:
             img_inp, _ = process_vision_info(msgs)
-            image_inputs_list.append(img_inp)  # list of PIL images or None
-
-        # Flatten non-None images for the processor
-        all_images = []
-        for imgs in image_inputs_list:
-            if imgs:
-                all_images.extend(imgs)
+            if img_inp:
+                all_images.extend(img_inp)
 
         proc_kwargs = dict(
             text=texts,
@@ -208,46 +192,17 @@ Question: {} Let's think step by step:
         inputs = self.processor(**proc_kwargs)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-        # Let the VL model fuse image tokens into the embedding sequence.
-        # Qwen2.5-VL exposes prepare_inputs_embeds (or similar); we replicate
-        # the logic used inside its forward() to merge ViT features.
-        inputs_embeds, attention_mask, position_ids = self._vl_prepare_embeds(inputs)
+        # Build forward_kwargs — Qwen3-VL forward() accepts these directly
+        forward_kwargs = {
+            "input_ids": inputs["input_ids"],
+            "attention_mask": inputs["attention_mask"],
+        }
+        if "pixel_values" in inputs:
+            forward_kwargs["pixel_values"] = inputs["pixel_values"]
+        if "image_grid_thw" in inputs:
+            forward_kwargs["image_grid_thw"] = inputs["image_grid_thw"]
 
-        return inputs_embeds, attention_mask, position_ids, inputs["input_ids"]
-
-    def _vl_prepare_embeds(self, inputs):
-        """
-        Merge text token embeddings with ViT image features for Qwen2.5-VL.
-
-        Qwen2.5-VL provides a helper method `model.prepare_inputs_embeds` that
-        accepts (input_ids, pixel_values, image_grid_thw) and returns
-        (inputs_embeds, attention_mask, position_ids).
-        We call it here so the rest of CoLaR only sees a plain embedding tensor.
-        """
-        pixel_values   = inputs.get("pixel_values", None)
-        image_grid_thw = inputs.get("image_grid_thw", None)
-
-        # Access the underlying base model (unwrapped from PEFT if needed)
-        base_model = self.llm.model if hasattr(self.llm, "model") else self.llm
-
-        if pixel_values is not None:
-            # Qwen2.5-VL base model has `get_rope_index` and
-            # `prepare_inputs_embeds`; call them to merge ViT features.
-            inputs_embeds, attention_mask, position_ids = (
-                base_model.prepare_inputs_embeds(
-                    input_ids=inputs["input_ids"],
-                    pixel_values=pixel_values,
-                    image_grid_thw=image_grid_thw,
-                    attention_mask=inputs["attention_mask"],
-                )
-            )
-        else:
-            # Text-only fallback
-            inputs_embeds = self.embedding(inputs["input_ids"])
-            attention_mask = inputs["attention_mask"]
-            position_ids = get_position_ids_from_attention_mask(attention_mask)
-
-        return inputs_embeds, attention_mask, position_ids
+        return forward_kwargs, inputs["input_ids"]
 
     # ── original text-only prepare_inputs (unchanged) ────────────────────────
     def prepare_inputs(self, text_list, padding_side, part, prefix="", suffix=""):
@@ -263,7 +218,7 @@ Question: {} Let's think step by step:
         base_template = getattr(self, f"{part}_template")
         text_list = [prefix[i] + base_template.format(text) + suffix[i] for i, text in enumerate(text_list)]
 
-        inputs = self.tokenizer.batch_encode_plus(
+        inputs = self.tokenizer(
             text_list, return_tensors="pt", add_special_tokens=False, padding="longest", padding_side=padding_side
         )
         input_ids = inputs["input_ids"].to(self.device)
@@ -367,7 +322,7 @@ Question: {} Let's think step by step:
         self.json_logger.log(self.sample_logs)
         return super().on_test_end()
 
-    # ── text generation (unchanged) ───────────────────────────────────────────
+    # ── text generation ───────────────────────────────────────────────────────
     @torch.no_grad()
     def text_generate(self, questions: List[str], images=None):
         answer_generation_config = self.model_kwargs.answer_generation_config
@@ -377,13 +332,11 @@ Question: {} Let's think step by step:
             images = images or [None] * batch_size
             suffix = self.speed_template.format(1) + self.thinking_separator \
                 if self.model_kwargs.sft_method == "cot" else ""
-            inputs_embeds, attention_mask, position_ids, input_ids = self.prepare_inputs_vl(
+            forward_kwargs, _ = self.prepare_inputs_vl(
                 questions, images, padding_side="left", suffix=suffix
             )
             outputs = self.llm.generate(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
+                **forward_kwargs,
                 **answer_generation_config,
             )
         else:
@@ -417,7 +370,7 @@ Question: {} Let's think step by step:
     def latent_generate(
         self,
         questions,
-        images=None,          # NEW: List[PIL.Image | None]
+        images=None,
         rl_mode=False,
         return_latent_hidden_states=False,
     ):
@@ -428,6 +381,9 @@ Question: {} Let's think step by step:
 
         batch_size = len(questions)
         n_latent_forward = torch.zeros(size=(batch_size, 1), device=self.device, dtype=torch.long)
+        # For VL: all_inputs_embeds only holds latent + end-of-thinking embeds
+        # (the question tokens are processed inside llm.forward via pixel_values).
+        # For text-only: also holds question_inputs_embeds as before.
         all_inputs_embeds = []
 
         # ── 1: question forward ───────────────────────────────────────────────
@@ -436,13 +392,15 @@ Question: {} Let's think step by step:
 
         if self.is_vl:
             images = images or [None] * batch_size
-            question_inputs_embeds, question_attention_mask, question_position_ids, question_input_ids = (
-                self.prepare_inputs_vl(questions, images, padding_side="left", suffix=suffix)
+            # prepare_inputs_vl returns (forward_kwargs, question_input_ids)
+            forward_kwargs, question_input_ids = self.prepare_inputs_vl(
+                questions, images, padding_side="left", suffix=suffix
             )
+            question_attention_mask = forward_kwargs["attention_mask"]
+            question_position_ids = get_position_ids_from_attention_mask(question_attention_mask)
+            # First forward: Qwen3-VL fuses pixel_values internally
             outputs = self.llm.forward(
-                inputs_embeds=question_inputs_embeds,
-                attention_mask=question_attention_mask,
-                position_ids=question_position_ids,
+                **forward_kwargs,
                 output_hidden_states=True,
             )
         else:
@@ -457,10 +415,9 @@ Question: {} Let's think step by step:
                 position_ids=question_position_ids,
                 output_hidden_states=True,
             )
+            all_inputs_embeds.append(question_inputs_embeds)
 
-        all_inputs_embeds.append(question_inputs_embeds)
-
-        # ── 2: latent forward (identical logic to original) ───────────────────
+        # ── 2: latent forward ─────────────────────────────────────────────────
         all_attention_mask = question_attention_mask
         current_position_ids = question_position_ids[:, -1:]
         past_key_values = outputs.past_key_values
@@ -487,6 +444,7 @@ Question: {} Let's think step by step:
             current_position_ids = current_position_ids + not_is_done_long
             n_latent_forward += not_is_done_long
 
+            # Subsequent steps: always use inputs_embeds (no pixel_values needed)
             outputs = self.llm.forward(
                 inputs_embeds=current_inputs_embeds,
                 attention_mask=all_attention_mask,
@@ -517,6 +475,10 @@ Question: {} Let's think step by step:
         )
 
         # ── 4: answer generation ──────────────────────────────────────────────
+        # For VL: we cannot reliably pass past_key_values to generate() because
+        # Qwen3-VL needs cache_position alignment. Instead we do a full prefill
+        # by passing all latent+end-of-thinking embeds WITHOUT past_key_values.
+        # The attention_mask covers the full sequence length (question + latent).
         all_inputs_embeds_cat = torch.cat(all_inputs_embeds, dim=1)
         pred_ids = self.llm.generate(
             inputs_embeds=all_inputs_embeds_cat,
@@ -557,16 +519,17 @@ Question: {} Let's think step by step:
         if self.is_vl:
             images = images or [None] * batch_size
             suffix = self.speed_template.format("auto") + self.thinking_separator
-            inputs_embeds, attention_mask, position_ids, _ = self.prepare_inputs_vl(
+            forward_kwargs, _ = self.prepare_inputs_vl(
                 questions, images, padding_side="left", suffix=suffix
             )
+            attention_mask = forward_kwargs["attention_mask"]
             outputs = self.llm.forward(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
+                **forward_kwargs,
                 output_hidden_states=True,
             )
-            all_inputs_embeds.append(inputs_embeds)
+            # No question_inputs_embeds to append for VL (fusion is internal)
+            # Save past_key_values for continuation
+            past_key_values = outputs.past_key_values
         else:
             question_input_ids, attention_mask = self.prepare_inputs(
                 questions,
@@ -581,6 +544,7 @@ Question: {} Let's think step by step:
                 output_hidden_states=True,
             )
             all_inputs_embeds.append(question_embeds)
+            past_key_values = None  # text-only: no past_key_values reuse needed
 
         for i in range(max_n_latent_forward):
             inputs_embeds = outputs.hidden_states[-1][:, -1:, :]
@@ -591,11 +555,20 @@ Question: {} Let's think step by step:
                 [attention_mask, torch.ones(size=(batch_size, 1), device=self.device, dtype=torch.long)],
                 dim=1,
             )
-            outputs = self.llm.forward(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-            )
+            if self.is_vl:
+                outputs = self.llm.forward(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    output_hidden_states=True,
+                )
+                past_key_values = outputs.past_key_values
+            else:
+                outputs = self.llm.forward(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                )
 
         end_of_thinking_ids = (
             torch.ones(size=(batch_size, 1), device=self.device, dtype=torch.long) * self.thinking_separator_id
@@ -607,9 +580,11 @@ Question: {} Let's think step by step:
             dim=1,
         )
 
-        all_inputs_embeds = torch.cat(all_inputs_embeds, dim=1)
+        all_inputs_embeds_cat = torch.cat(all_inputs_embeds, dim=1)
         pred_ids = self.llm.generate(
-            inputs_embeds=all_inputs_embeds, attention_mask=attention_mask, **answer_generation_config
+            inputs_embeds=all_inputs_embeds_cat,
+            attention_mask=attention_mask,
+            **answer_generation_config,
         )
         return pred_ids, torch.ones(size=(batch_size, 1), device=self.device, dtype=torch.long) * max_n_latent_forward
 
