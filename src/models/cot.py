@@ -4,6 +4,8 @@ from .model_base import LitCoTModelBase
 from ..utils.utils import get_position_ids_from_attention_mask
 
 
+
+
 class LitCot(LitCoTModelBase):
     def __init__(
         self,
